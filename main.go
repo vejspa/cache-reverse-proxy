@@ -2,10 +2,8 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -32,24 +30,18 @@ func newCache(ttl time.Duration) *cache {
 	}
 }
 
-func newReverseProxy() *httputil.ReverseProxy {
-	target, err := url.Parse("https://dummyjson.com")
+func newReverseProxy(urlName string) *httputil.ReverseProxy {
+	target, err := url.Parse(urlName)
 
 	if err != nil {
 		log.Fatal("could not parse server url")
 	}
 
-	// TODO remove x-forward-for
 	d := func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = target.Host
-
-		ip, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err == nil {
-			req.Header.Add("X-Forwarded-For", ip)
-		}
-		log.Println(ip)
+		req.Header.Del("X-Forwarded-For")
 	}
 
 	return &httputil.ReverseProxy{
@@ -65,7 +57,7 @@ func main() {
 }
 
 func run() error {
-	rp := newReverseProxy()
+	rp := newReverseProxy("https://dummyjson.com")
 	c := newCache(3 * time.Hour)
 
 	rp.ModifyResponse = func(res *http.Response) error {
@@ -102,7 +94,6 @@ func run() error {
 			}
 
 			res.Header.Add("X-Cache", "MISS")
-			res.Header.Add("X-RP", fmt.Sprintf("%p", rp))
 
 			return nil
 		}
@@ -124,8 +115,6 @@ func run() error {
 				}
 
 				w.Header().Set("X-Cache", "HIT")
-				w.Header().Set("X-RPHandleFunc", fmt.Sprintf("%p", rp))
-
 				w.WriteHeader(d.status)
 
 				_, err := w.Write(d.body)
@@ -148,6 +137,12 @@ func run() error {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
+	defer func(srv *http.Server) {
+		err := srv.Close()
+		if err != nil {
+			log.Fatal("Cannot close server")
+		}
+	}(srv)
 
 	log.Printf("Reverse-proxy listening on %s", srv.Addr)
 
