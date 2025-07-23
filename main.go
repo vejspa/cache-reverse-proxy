@@ -14,9 +14,18 @@ import (
 	"time"
 )
 
+var TTL time.Duration = 0
+var CleanUpPeriod time.Duration = 0
+
 const (
 	XCacheMiss = "MISS"
 	XCacheHit  = "HIT"
+)
+
+const (
+	ReadTimeoutAmount   = 10
+	WriteTimeoutAmount  = 10
+	FlushIntervalAmount = 10
 )
 
 type cacheData struct {
@@ -53,7 +62,7 @@ func newReverseProxy(urlName string) *httputil.ReverseProxy {
 	}
 
 	return &httputil.ReverseProxy{
-		FlushInterval: 10 * time.Millisecond,
+		FlushInterval: FlushIntervalAmount * time.Millisecond,
 		Director:      d,
 	}
 }
@@ -69,45 +78,22 @@ func run() error {
 	ttl := getTTL()
 	c := newCache(ttl)
 
+	cup := getCleanUpPeriod()
+	c.startCleanupWorker(cup)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			c.mu.RLock()
 			d, ok := c.data[r.RequestURI]
 			c.mu.RUnlock()
 
-			if ok && !isCacheStale(d.age) {
-				for k, vv := range d.header {
-					for _, v := range vv {
-						w.Header().Add(k, v)
-					}
-				}
-
-				w.Header().Set("X-Cache", XCacheHit)
-				w.WriteHeader(d.status)
-
-				_, err := w.Write(d.body)
-
-				if err != nil {
-					log.Printf("can't write to body %s", err)
-
-					return
-				}
+			if ok && !isCacheStale(d.age, c.ttl) {
+				writeToResponseCacheHit(w, d)
 
 				return
 			}
 
-			rp.ModifyResponse = func(res *http.Response) error {
-				if res.Request.Method != http.MethodGet {
-					return nil
-				}
-
-				err := saveCacheData(res, c, XCacheMiss)
-
-				if nil != err {
-					log.Printf("error while saving stale cache %s", err)
-				}
-				return nil
-			}
+			handleMissedCache(rp, c)
 		}
 
 		rp.ServeHTTP(w, r)
@@ -115,12 +101,11 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:         ":8080",
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  ReadTimeoutAmount * time.Second,
+		WriteTimeout: WriteTimeoutAmount * time.Second,
 	}
 	defer func(srv *http.Server) {
-		err := srv.Close()
-		if err != nil {
+		if err := srv.Close(); err != nil {
 			log.Fatal("Cannot close server")
 		}
 	}(srv)
@@ -132,6 +117,39 @@ func run() error {
 	}
 
 	return nil
+}
+
+func handleMissedCache(rp *httputil.ReverseProxy, c *cache) {
+	rp.ModifyResponse = func(res *http.Response) error {
+		if res.Request.Method != http.MethodGet {
+			return nil
+		}
+
+		err := saveCacheData(res, c, XCacheMiss)
+
+		if nil != err {
+			log.Printf("error while saving stale cache %s", err)
+		}
+
+		return nil
+	}
+}
+
+func writeToResponseCacheHit(w http.ResponseWriter, d cacheData) {
+	for k, vv := range d.header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	w.Header().Set("X-Cache", XCacheHit)
+	w.WriteHeader(d.status)
+
+	_, err := w.Write(d.body)
+
+	if err != nil {
+		log.Printf("can't write to body %s", err)
+	}
 }
 
 func saveCacheData(res *http.Response, c *cache, xCacheValue string) error {
@@ -159,10 +177,15 @@ func saveCacheData(res *http.Response, c *cache, xCacheValue string) error {
 	c.mu.Unlock()
 
 	res.Header.Add("X-Cache", xCacheValue)
+
 	return nil
 }
 
 func getTTL() time.Duration {
+	if 0 != TTL {
+		return TTL
+	}
+
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("error loading .env file %s", err)
 	}
@@ -173,10 +196,60 @@ func getTTL() time.Duration {
 		log.Fatalf("cannot convert ttl to int %s", err)
 	}
 
-	return time.Duration(hours) * time.Hour
+	TTL = time.Duration(hours) * time.Hour
+
+	return TTL
 }
 
-func isCacheStale(age time.Time) bool {
-	ttl := getTTL()
-	return time.Now().After(age.Add(ttl))
+func getCleanUpPeriod() time.Duration {
+	if 0 != CleanUpPeriod {
+		return CleanUpPeriod
+	}
+
+	if err := godotenv.Load(); err != nil {
+		log.Fatalf("error loading .env file %s", err)
+	}
+
+	hours, err := strconv.Atoi(os.Getenv("CLEAN_UP_PERIOD"))
+
+	if nil != err {
+		log.Fatalf("cannot convert ttl to int %s", err)
+	}
+
+	CleanUpPeriod = time.Duration(hours) * time.Hour
+
+	return CleanUpPeriod
+}
+
+func isCacheStale(a time.Time, ttl time.Duration) bool {
+	return time.Now().After(a.Add(ttl))
+}
+
+func (c *cache) startCleanupWorker(i time.Duration) {
+	go func() {
+		ticker := time.NewTicker(i)
+		ttl := getTTL()
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				c.cleanup(ttl)
+			}
+		}
+	}()
+}
+
+func (c *cache) cleanup(ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, d := range c.data {
+		if isCacheStale(d.age, ttl) {
+			delete(c.data, key)
+			log.Printf("deleted cache with key: %s", key)
+		}
+	}
+
+	log.Println("cache cleanup completed")
 }
