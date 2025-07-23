@@ -8,11 +8,13 @@ This is a lightweight reverse proxy server written in Go, with built-in caching 
 - Caching of HTTP `GET` responses
 - Configurable TTL for cache expiration
 - Cache hit/miss detection via `X-Cache` headers
+- Periodic stale cache deletion worker
 
 ## Requirements
 - Go 1.24 or higher
 - A `.env` file containing the following variable:
   - `TTL`: Cache expiration time in hours (integer)
+  - `CLEAN_UP_PERIOD`: Clean-up period used for worker to periodicly delete stale cache(integer)
 
 ## Installation
 
@@ -32,4 +34,4 @@ This is a lightweight reverse proxy server written in Go, with built-in caching 
 1. Reverse-Proxy listens on port 8080 requests
 2. By default handles requests directed to https://dummyjson.com
 3. Removes X-Forwarded-For to avoid IP spoofing
-4. Inside .env store TTL value in hours.
+4. Inside .env store TTL and CLEAN_UP_PERIOD value in hours.
